@@ -35,6 +35,7 @@ from std_msgs.msg import Header
 from tf2_ros import TransformBroadcaster
 
 from spaceship_msgs.msg import MotorCommand, ShipState
+from spaceship_msgs.srv import SetMotorPower
 
 # ── Constantes físicas ────────────────────────────────────────────────
 MAX_THRUST    = 3.0
@@ -116,6 +117,9 @@ class ShipSimulator(Node):
         self.create_subscription(
             PointStamped, '/clicked_point', self.on_clicked_point, 10)
 
+        self.create_service(
+            SetMotorPower, '/set_motor_power', self.on_set_motor_power)
+
         self.pub_state  = self.create_publisher(ShipState,    '/ship_state',  10)
         self.pub_target = self.create_publisher(PointStamped, '/ship_target', 10)
 
@@ -155,13 +159,36 @@ class ShipSimulator(Node):
             self.timer_running = True
             self._init_wind()
 
+    def on_set_motor_power(self, request: SetMotorPower.Request,
+                           response: SetMotorPower.Response):
+        power = int(max(0, min(100, request.power)))
+        if request.motor_id == 0:
+            self.power_m1 = power
+            self.power_m2 = power
+        elif request.motor_id == 1:
+            self.power_m1 = power
+        elif request.motor_id == 2:
+            self.power_m2 = power
+        else:
+            response.success = False
+            response.message = f'motor_id invalido: {request.motor_id}'
+            return response
+
+        if power > 0 and not self.timer_running and not self.arrived:
+            self.timer_running = True
+            self._init_wind()
+
+        response.success = True
+        response.message = f'motor_id={request.motor_id} power={power}'
+        return response
+
     def on_clicked_point(self, msg: PointStamped):
         """Nuevo target desde RViz — resetea cronómetro y viento."""
         self.target_x = msg.point.x
         self.target_y = msg.point.y
         self._reset_run()
         self.get_logger().info(
-            f'🎯 Nuevo target: ({self.target_x:.2f}, {self.target_y:.2f})'
+            f'Nuevo target: ({self.target_x:.2f}, {self.target_y:.2f})'
         )
         self._publish_target()
 
@@ -276,7 +303,7 @@ class ShipSimulator(Node):
                 self.arrived       = True
                 self.timer_running = False
                 self.get_logger().info(
-                    f'✅ LLEGADO en {self.elapsed_time:.2f}s  '
+                    f'LLEGADO en {self.elapsed_time:.2f}s  '
                     f'dist={dist:.2f}m  speed={speed:.3f}m/s'
                 )
 

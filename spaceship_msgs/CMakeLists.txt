@@ -13,6 +13,7 @@ find_package(geometry_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/MotorCommand.msg"
   "msg/ShipState.msg"
+  "srv/SetMotorPower.srv"
   DEPENDENCIES std_msgs geometry_msgs
 )
 

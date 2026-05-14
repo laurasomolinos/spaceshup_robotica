@@ -9,7 +9,6 @@
 
   <depend>rclpy</depend>
   <depend>spaceship_msgs</depend>
-  <depend>spaceship_student_ls_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>visualization_msgs</depend>
 
