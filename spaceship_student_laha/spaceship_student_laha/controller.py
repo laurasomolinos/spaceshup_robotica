@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from dbm import error
 import math
 from enum import Enum
 
@@ -7,6 +8,7 @@ from rclpy.node import Node
 
 from spaceship_msgs.msg import ShipState
 from spaceship_msgs.srv import SetMotorPower
+from spaceship_student_laha_msgs.msg import ControlDebug
 
 
 class State(Enum):
@@ -59,7 +61,17 @@ class ShipController(Node):
 
         # ── Cliente del servicio (R2) ─────────────────────────────────
         self.motor_client = self.create_client(SetMotorPower, '/set_motor_power')
+        
+        # ── Publisher de depuración del controlador (R4) ───────────────────
+        self.debug_pub = self.create_publisher(ControlDebug, '/control_debug', 10)
 
+        # Últimos valores calculados por el controlador
+        self._last_desired_heading = 0.0
+        self._last_heading_error = 0.0
+        self._last_acc_mag = 0.0
+        self._last_power = 0
+        self._last_m1 = 0
+        self._last_m2 = 0
         # ── Suscripción al estado (R3) ────────────────────────────────
         self.create_subscription(ShipState, '/ship_state', self._on_ship_state, 10)
 
@@ -87,15 +99,22 @@ class ShipController(Node):
                 f'¡LLEGADO! Tiempo: {msg.elapsed_time:.2f}s')
             return
 
-        # Si no tenemos target y el simulador ya tiene uno, lo tomamos
-        if self.state == State.IDLE and (msg.target_x != 0.0 or msg.target_y != 0.0):
-            self.target_x = msg.target_x
-            self.target_y = msg.target_y
-            self._turn_dir = 0
-            self.state = State.ORIENT
-            self.get_logger().info(
-                f'Target desde ship_state: ({self.target_x:.1f}, {self.target_y:.1f})')
+        # Tomamos el target del simulador siempre que exista.
+        # Si cambia por un nuevo click en RViz, actualizamos el objetivo.
+        if msg.target_x != 0.0 or msg.target_y != 0.0:
+            target_changed = (
+                abs(msg.target_x - self.target_x) > 0.01 or
+                abs(msg.target_y - self.target_y) > 0.01
+            )
 
+            if self.state == State.IDLE or target_changed:
+                self.target_x = msg.target_x
+                self.target_y = msg.target_y
+                self._turn_dir = 0
+                self.state = State.THRUST
+                self.get_logger().info(
+                    f'Target actualizado desde ship_state: ({self.target_x:.1f}, {self.target_y:.1f})'
+                )
     # ── Bucle de control ──────────────────────────────────────────────
 
     def _control_loop(self):
@@ -103,169 +122,175 @@ class ShipController(Node):
             return
 
         s = self.ship
-        dx = self.target_x - s.x
-        dy = self.target_y - s.y
-        dist = math.sqrt(dx * dx + dy * dy)
-        speed = math.sqrt(s.vx ** 2 + s.vy ** 2)
 
-        desired_heading = math.atan2(dy, dx)
-        heading_error = angle_diff(desired_heading, s.heading)
+        if s.arrived:
+            self._set_motor(0, 0)
+            self.state = State.ARRIVED
+            self.get_logger().info(f'¡LLEGADO! Tiempo: {s.elapsed_time:.2f}s')
+            return
 
-        eff_decel = max(LINEAR_DRAG * speed + MAX_THRUST * 0.8, 1.0)
-        braking_dist = (speed ** 2) / (2.0 * eff_decel) + speed * 3.0 + 5.0
-
-        if self.state == State.ORIENT:
-            self._do_orient(heading_error, dist)
-        elif self.state == State.THRUST:
-            self._do_thrust(heading_error, dist, braking_dist)
-        elif self.state == State.BRAKE:
-            self._do_brake(s, dist, speed)
-        elif self.state == State.HOVER:
-            self._do_hover(s, heading_error, dist, speed)
+        self._simple_control(s)
 
     # ── Estados ───────────────────────────────────────────────────────
 
-    def _do_orient(self, heading_error: float, dist: float):
-        """Gira la nave para apuntar al objetivo (control proporcional)."""
-        if abs(heading_error) < self.ORIENT_THRESH:
-            self._set_motor(0, 0)
-            self._turn_dir = 0
-            self.state = State.THRUST
-            self.get_logger().info('ORIENT → THRUST')
-            return
 
-        # Potencia proporcional al error: más lejos del ángulo correcto → giro más fuerte
-        # Mínimo 20 para garantizar movimiento, máximo turn_power
-        turn = int(max(20, min(self.turn_power, abs(heading_error) * 30)))
+    def _simple_control(self, s: ShipState):
+        """
+        Control PD en posición + velocidad.
 
-        # Bloqueamos dirección solo cerca de ±180° (donde angle_diff oscila de signo).
-        # En cualquier otro caso, seguimos el signo del error para frenar el overshoot.
-        if self._turn_dir == 0 or abs(heading_error) < math.pi * 0.8:
-            self._turn_dir = 1 if heading_error > 0 else -1
+        En vez de apuntar siempre al target, calcula una aceleración deseada:
+            a_cmd = Kp * error_posicion - Kd * velocidad
 
-        if self._turn_dir > 0:   # girar izquierda (M1 > M2)
-            self._set_motor(1, turn)
-            self._set_motor(2, 0)
-        else:                    # girar derecha (M2 > M1)
-            self._set_motor(1, 0)
-            self._set_motor(2, turn)
-
-    def _do_thrust(self, heading_error: float, dist: float, braking_dist: float):
-        """Acelera hacia el objetivo con corrección de heading."""
-        if dist < braking_dist:
-            self.state = State.BRAKE
-            self.get_logger().info(f'THRUST → BRAKE  dist={dist:.1f}  brake_dist={braking_dist:.1f}')
-            return
-
-        # Si nos hemos desviado mucho, volvemos a orientar antes de empujar
-        if abs(heading_error) > 0.6:
-            self.state = State.ORIENT
-            return
-
-        # Corrección proporcional de heading mientras empujamos
-        correction = int(min(self.turn_power, abs(heading_error) * 40))
-        if heading_error > 0:  # girar izquierda: M1 > M2
-            self._set_motor(1, self.max_power)
-            self._set_motor(2, max(0, self.max_power - correction))
-        else:                  # girar derecha: M2 > M1
-            self._set_motor(1, max(0, self.max_power - correction))
-            self._set_motor(2, self.max_power)
-
-    def _do_brake(self, s: ShipState, dist: float, speed: float):
-        """Frena apuntando en sentido contrario al movimiento y empujando."""
-        if speed < 0.8:
-            # Velocidad suficientemente baja: pasar a aproximación suave
-            self._set_motor(0, 0)
-            self._turn_dir = 0
-            self.state = State.HOVER
-            self.get_logger().info(f'BRAKE → HOVER  dist={dist:.1f}m')
-            return
-
-        # Dirección opuesta a la velocidad actual = dirección de frenado
-        vel_dir = math.atan2(s.vy, s.vx)
-        brake_heading = vel_dir + math.pi
-        while brake_heading > math.pi:
-            brake_heading -= 2 * math.pi
-
-        brake_error = angle_diff(brake_heading, s.heading)
-
-        if abs(brake_error) < 0.5:
-            # Alineado a retrogrado: empujar + amortiguar omega residual
-            omega_correction = int(min(20, abs(s.omega) * 25))
-            if s.omega > 0:  # heading sube → contrarresta con M2 > M1
-                self._set_motor(1, max(0, self.max_power - omega_correction))
-                self._set_motor(2, self.max_power)
-            else:
-                self._set_motor(1, self.max_power)
-                self._set_motor(2, max(0, self.max_power - omega_correction))
-        else:
-            # Girando a retrogrado: potencia baja para no acumular omega
-            turn = int(max(10, min(20, abs(brake_error) * 12)))
-            if brake_error > 0:  # girar izquierda: M1 > M2
-                self._set_motor(1, turn)
-                self._set_motor(2, 0)
-            else:                # girar derecha: M2 > M1
-                self._set_motor(1, 0)
-                self._set_motor(2, turn)
-
-    def _do_hover(self, s: ShipState, heading_error: float, dist: float, speed: float):
-        """Aproximación final con control de velocidad proporcional (resistente a viento)."""
-        if dist > 15.0:
-            self._turn_dir = 0
-            self.state = State.ORIENT
-            self.get_logger().info('HOVER → ORIENT (demasiado lejos)')
-            return
+        Así, si la nave va muy rápido hacia el target, la aceleración deseada
+        apunta hacia atrás y la nave frena antes de pasarse.
+        """
 
         dx = self.target_x - s.x
         dy = self.target_y - s.y
 
-        if dist < 7.0:
-            # Control de velocidad: desired_v apunta al target a velocidad segura.
-            # El error de velocidad actúa de freno (si vamos rápido) y de empuje
-            # (si el viento nos aleja), compensando perturbaciones automáticamente.
-            approach_speed = min(0.18, dist * 0.06)
-            desired_vx = approach_speed * dx / max(dist, 0.1)
-            desired_vy = approach_speed * dy / max(dist, 0.1)
+        dist = math.sqrt(dx * dx + dy * dy)
+        speed = math.sqrt(s.vx * s.vx + s.vy * s.vy)
 
-            err_vx = desired_vx - s.vx
-            err_vy = desired_vy - s.vy
-            err_mag = math.sqrt(err_vx ** 2 + err_vy ** 2)
+        # Condición de llegada del simulador: dist < 2.0 y speed < 0.1.
+        # Si estamos casi ahí, paramos motores y dejamos que el simulador marque arrived.
+        if dist < 1.9 and speed < 0.10:
+            self._set_motor(0, 0)
+            self.state = State.HOVER
+            return
 
-            thrust_dir = math.atan2(err_vy, err_vx)
-            thrust_error = angle_diff(thrust_dir, s.heading)
+        # Ganancias simples. Si oscila mucho, baja KP. Si se pasa de largo, sube KD.
+        KP = 0.30
+        KD = 1.45
 
-            power = int(min(70, max(15, err_mag * 50)))
+        # Aceleración deseada en coordenadas mundo.
+        ax_cmd = KP * dx - KD * s.vx
+        ay_cmd = KP * dy - KD * s.vy
 
-            if abs(thrust_error) < 0.5:
-                self._set_motor(0, power)
-                self._turn_dir = 0
-            else:
-                if self._turn_dir == 0 or abs(thrust_error) < math.pi * 0.8:
-                    self._turn_dir = 1 if thrust_error > 0 else -1
-                turn = int(max(15, min(30, abs(thrust_error) * 20)))
-                if self._turn_dir > 0:
-                    self._set_motor(1, turn)
-                    self._set_motor(2, 0)
-                else:
-                    self._set_motor(1, 0)
-                    self._set_motor(2, turn)
+        acc_mag = math.sqrt(ax_cmd * ax_cmd + ay_cmd * ay_cmd)
+
+        # Si la corrección es muy pequeña, no empujamos.
+        if acc_mag < 0.08:
+            self._set_motor(0, 0)
+            self.state = State.HOVER
+            return
+
+        desired_heading = math.atan2(ay_cmd, ax_cmd)
+        self._last_desired_heading = desired_heading
+        self._last_acc_mag = acc_mag
+
+        # Convertimos aceleración deseada a potencia.
+        # MAX_THRUST = 3.0, así que acc/MAX_THRUST * 100 da potencia aproximada.
+        power = int((acc_mag / MAX_THRUST) * 100.0)
+
+        # Limitamos potencia para que no vaya como un misil.
+        power = max(12, min(self.max_power, power))
+        self._last_power = power
+
+        # Fase solo para logs.
+        if dist < 5.0 and speed > 0.20:
+            self.state = State.BRAKE
+        elif dist < 3.0:
+            self.state = State.HOVER
         else:
-            # Lejos: empuje directo hacia el target con potencia suficiente para el viento
-            if abs(heading_error) > self.ORIENT_THRESH:
-                if self._turn_dir == 0 or abs(heading_error) < math.pi * 0.8:
-                    self._turn_dir = 1 if heading_error > 0 else -1
-                turn = int(max(15, min(self.turn_power, abs(heading_error) * 25)))
-                if self._turn_dir > 0:
-                    self._set_motor(1, turn)
-                    self._set_motor(2, 0)
-                else:
-                    self._set_motor(1, 0)
-                    self._set_motor(2, turn)
-            else:
-                hover_power = int(max(40, min(70, dist * 8.0)))
-                self._turn_dir = 0
-                self._set_motor(0, hover_power)
+            self.state = State.THRUST
 
+        self._drive_towards_angle(
+            current_heading=s.heading,
+            desired_heading=desired_heading,
+            power=power,
+            turn_power=self.turn_power
+        )
+
+
+    def _drive_towards_angle(self, current_heading: float, desired_heading: float,
+                            power: int, turn_power: int):
+        """
+        Apunta la nave hacia desired_heading y aplica potencia cuando está alineada.
+
+        Según la física:
+            torque = (F1 - F2) * ARM_LENGTH
+
+        Por tanto:
+            M1 > M2 aumenta heading
+            M2 > M1 disminuye heading
+        """
+
+        error = angle_diff(desired_heading, current_heading)
+
+        # Si está muy desalineada, giramos casi en el sitio con potencia moderada.
+        # No metemos mucho giro para no añadir demasiada velocidad lineal accidental.
+        if abs(error) > 0.45:
+            turn = int(max(10, min(turn_power, abs(error) * 26)))
+            if error > 0:
+                self._last_m1 = int(turn)
+                self._last_m2 = 0
+                self._set_motor(1, turn)
+                self._set_motor(2, 0)
+            else:
+                self._last_m1 = 0
+                self._last_m2 = int(turn)
+                self._set_motor(1, 0)
+                self._set_motor(2, turn)
+
+            self._last_heading_error = error
+            self._publish_debug()
+            return
+
+        # Si está alineada, empujamos con corrección diferencial.
+        correction = int(min(turn_power, abs(error) * 35))
+
+        if error > 0:
+            # Girar suavemente a izquierda: M1 algo mayor
+            m1 = power
+            m2 = max(0, power - correction)
+        else:
+            # Girar suavemente a derecha: M2 algo mayor
+            m1 = max(0, power - correction)
+            m2 = power
+
+        self._last_m1 = int(m1)
+        self._last_m2 = int(m2)
+        self._last_heading_error = error
+
+        self._set_motor(1, int(m1))
+        self._set_motor(2, int(m2))
+
+        self._publish_debug()
+
+    def _publish_debug(self):
+        """Publica información interna del controlador en /control_debug."""
+        if self.ship is None:
+            return
+
+        s = self.ship
+
+        dx = self.target_x - s.x
+        dy = self.target_y - s.y
+
+        dist = math.sqrt(dx * dx + dy * dy)
+        speed = math.sqrt(s.vx * s.vx + s.vy * s.vy)
+
+        msg = ControlDebug()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'world'
+
+        msg.phase = self.state.value
+
+        msg.target_x = float(self.target_x)
+        msg.target_y = float(self.target_y)
+
+        msg.distance_to_target = float(dist)
+        msg.speed = float(speed)
+
+        msg.desired_heading = float(self._last_desired_heading)
+        msg.heading_error = float(self._last_heading_error)
+
+        msg.commanded_acceleration = float(self._last_acc_mag)
+
+        msg.power_m1 = int(max(0, min(100, self._last_m1)))
+        msg.power_m2 = int(max(0, min(100, self._last_m2)))
+
+        self.debug_pub.publish(msg)
     # ── Log periódico ─────────────────────────────────────────────────
 
     def _log_status(self):
