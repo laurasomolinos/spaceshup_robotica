@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-from dbm import error
+from geometry_msgs.msg import Point
+from std_msgs.msg import ColorRGBA
+from visualization_msgs.msg import Marker, MarkerArray
 import math
 from enum import Enum
 
@@ -64,6 +66,8 @@ class ShipController(Node):
         
         # ── Publisher de depuración del controlador (R4) ───────────────────
         self.debug_pub = self.create_publisher(ControlDebug, '/control_debug', 10)
+        #-
+        self.marker_pub = self.create_publisher(MarkerArray, '/controller_markers', 10)
 
         # Últimos valores calculados por el controlador
         self._last_desired_heading = 0.0
@@ -159,7 +163,7 @@ class ShipController(Node):
             return
 
         # Ganancias simples. Si oscila mucho, baja KP. Si se pasa de largo, sube KD.
-        KP = 0.30
+        KP = 0.3
         KD = 1.45
 
         # Aceleración deseada en coordenadas mundo.
@@ -234,6 +238,7 @@ class ShipController(Node):
 
             self._last_heading_error = error
             self._publish_debug()
+            self._publish_markers()
             return
 
         # Si está alineada, empujamos con corrección diferencial.
@@ -256,6 +261,7 @@ class ShipController(Node):
         self._set_motor(2, int(m2))
 
         self._publish_debug()
+        self._publish_markers()
 
     def _publish_debug(self):
         """Publica información interna del controlador en /control_debug."""
@@ -322,6 +328,107 @@ class ShipController(Node):
         req.motor_id = motor_id
         req.power = power
         self.motor_client.call_async(req)
+        
+    def _publish_markers(self):
+        """Publica MarkerArray con 3 elementos visuales en RViz."""
+        if self.ship is None:
+            return
+
+        s = self.ship
+        now = self.get_clock().now().to_msg()
+
+        state_colors = {
+            'IDLE':    (0.5, 0.5, 0.5),
+            'ORIENT':  (1.0, 0.8, 0.0),
+            'THRUST':  (0.0, 0.8, 1.0),
+            'BRAKE':   (1.0, 0.3, 0.0),
+            'HOVER':   (0.4, 1.0, 0.4),
+            'ARRIVED': (0.0, 1.0, 0.0),
+        }
+        r, g, b = state_colors.get(self.state.value, (1.0, 1.0, 1.0))
+
+        markers = MarkerArray()
+
+        # ── Marcador 1: Texto con fase, distancia y tiempo ────────────
+        dx = self.target_x - s.x
+        dy = self.target_y - s.y
+        dist = math.sqrt(dx * dx + dy * dy)
+
+        m_text = Marker()
+        m_text.header.stamp = now
+        m_text.header.frame_id = 'world'
+        m_text.ns = 'controller'
+        m_text.id = 0
+        m_text.type = Marker.TEXT_VIEW_FACING
+        m_text.action = Marker.ADD
+        m_text.pose.position.x = s.x
+        m_text.pose.position.y = s.y + 2.5
+        m_text.pose.position.z = 0.0
+        m_text.scale.z = 1.2
+        m_text.color.r = r
+        m_text.color.g = g
+        m_text.color.b = b
+        m_text.color.a = 1.0
+        m_text.text = (
+            f'[{self.state.value}]\n'
+            f'dist: {dist:.1f} m\n'
+            f't: {s.elapsed_time:.1f} s'
+        )
+        markers.markers.append(m_text)
+
+        # ── Marcador 2: Flecha heading deseado ────────────────────────
+        arrow_len = 3.5
+        m_arrow = Marker()
+        m_arrow.header.stamp = now
+        m_arrow.header.frame_id = 'world'
+        m_arrow.ns = 'controller'
+        m_arrow.id = 1
+        m_arrow.type = Marker.ARROW
+        m_arrow.action = Marker.ADD
+        m_arrow.scale.x = 0.15
+        m_arrow.scale.y = 0.35
+        m_arrow.scale.z = 0.35
+        m_arrow.color.r = 1.0
+        m_arrow.color.g = 1.0
+        m_arrow.color.b = 0.0
+        m_arrow.color.a = 1.0
+
+        hdg = self._last_desired_heading
+        p_start = Point()
+        p_start.x = s.x
+        p_start.y = s.y
+        p_end = Point()
+        p_end.x = s.x + arrow_len * math.cos(hdg)
+        p_end.y = s.y + arrow_len * math.sin(hdg)
+        m_arrow.points = [p_start, p_end]
+        markers.markers.append(m_arrow)
+
+        # ── Marcador 3: Flecha hacia el target ────────────────────────
+        m_line = Marker()
+        m_line.header.stamp = now
+        m_line.header.frame_id = 'world'
+        m_line.ns = 'controller'
+        m_line.id = 2
+        m_line.type = Marker.ARROW
+        m_line.action = Marker.ADD
+        m_line.scale.x = 0.10
+        m_line.scale.y = 0.25
+        m_line.scale.z = 0.25
+        m_line.color.r = r
+        m_line.color.g = g
+        m_line.color.b = b
+        m_line.color.a = 0.8
+
+        p2_start = Point()
+        p2_start.x = s.x
+        p2_start.y = s.y
+        p2_end = Point()
+        p2_end.x = self.target_x
+        p2_end.y = self.target_y
+        m_line.points = [p2_start, p2_end]
+        markers.markers.append(m_line)
+
+        self.marker_pub.publish(markers)
 
 
 def main(args=None):
